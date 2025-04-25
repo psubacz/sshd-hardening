@@ -1,0 +1,553 @@
+---
+# ssh_hardening_playbook.yml
+# Playbook to harden SSH configuration based on SSH Audit results
+# This will improve the security score from 33/100 to a much higher value
+# With conditional handling for macOS, Amazon Linux 2023, and RHEL 8
+
+- name: SSH Server Hardening
+  hosts: all
+  become: yes  # Use sudo
+  gather_facts: yes  # Needed to get OS information
+  vars:
+    # Configuration settings based on OS type
+    sshd_config_file: "{{ 
+      '/etc/ssh/sshd_config' if (ansible_os_family == 'RedHat' or ansible_os_family == 'Amazon') 
+      else '/etc/ssh/sshd_config' if ansible_os_family == 'Debian' 
+      else '/etc/ssh/sshd_config' if ansible_os_family == 'Darwin' 
+      else '/etc/ssh/sshd_config' 
+    }}"
+    
+    # SSH service name
+    ssh_service_name: "{{ 
+      'sshd' if (ansible_os_family == 'RedHat' or ansible_os_family == 'Amazon')
+      else 'ssh' if ansible_os_family == 'Debian'
+      else 'com.openssh.sshd' if ansible_os_family == 'Darwin'
+      else 'sshd'
+    }}"
+    # Specify strong host key algorithms (removing NIST P-curves)
+    host_key_algorithms:
+      - ssh-ed25519
+      - rsa-sha2-512
+      - rsa-sha2-256
+      - sk-ssh-ed25519@openssh.com
+      - sntrup761x25519-sha512@openssh.com
+      - mlkem768x25519-sha256@openssh.com
+
+    # Specify strong key exchange algorithms (removing weak DH and NIST P-curves)
+    kex_algorithms:
+      - sntrup761x25519-sha512@openssh.com
+      - mlkem768x25519-sha256@openssh.com
+      - curve25519-sha256
+      - curve25519-sha256@libssh.org
+      - diffie-hellman-group-exchange-sha256
+      - diffie-hellman-group16-sha512
+      - diffie-hellman-group18-sha512
+
+    # Specify strong ciphers
+    ciphers:
+      - chacha20-poly1305@openssh.com
+      - aes256-gcm@openssh.com
+      - aes128-gcm@openssh.com
+      - aes256-ctr
+      - aes192-ctr
+      - aes128-ctr
+
+    # Specify strong MAC algorithms (removing weak ones)
+    macs:
+      - hmac-sha2-512-etm@openssh.com
+      - hmac-sha2-256-etm@openssh.com
+      - umac-128-etm@openssh.com
+
+  tasks:
+    - name: Set OS type facts
+      set_fact:
+        is_macos: "{{ ansible_os_family == 'Darwin' }}"
+        is_rhel8: "{{ ansible_os_family == 'RedHat' and ansible_distribution_major_version == '8' }}"
+        is_al2023: "{{ ansible_os_family == 'Amazon' and ansible_distribution_major_version == '2023' }}"
+      
+    - name: Display OS information
+      debug:
+        msg: >
+          Operating system: {{ ansible_distribution }} {{ ansible_distribution_version }} 
+          ({{ ansible_os_family }}), 
+          SSH config file: {{ sshd_config_file }}
+          SSH service name: {{ ssh_service_name }}
+
+    - name: Check if OpenSSH is installed (Linux)
+      command: which sshd
+      register: sshd_exists
+      ignore_errors: yes
+      changed_when: false
+      when: not is_macos
+
+    - name: Check if OpenSSH is installed (macOS)
+      command: launchctl list | grep com.openssh.sshd
+      register: macos_sshd_exists
+      ignore_errors: yes
+      changed_when: false
+      when: is_macos
+
+    - name: Get OpenSSH version (Linux)
+      shell: sshd -V 2>&1 | awk '{print $1}' | cut -d'_' -f2
+      register: ssh_version
+      when: not is_macos and sshd_exists.rc == 0
+      changed_when: false
+
+    - name: Get OpenSSH version (macOS)
+      shell: ssh -V 2>&1 | awk '{print $1}' | cut -d'_' -f2
+      register: macos_ssh_version
+      when: is_macos
+      changed_when: false
+
+    - name: Display OpenSSH version
+      debug:
+        var: ssh_version.stdout if not is_macos else macos_ssh_version.stdout
+      when: (not is_macos and sshd_exists.rc == 0) or is_macos
+
+    - name: Create backup of original sshd_config (Linux)
+      copy:
+        src: "{{ sshd_config_file }}"
+        dest: "{{ sshd_config_file }}.backup.{{ ansible_date_time.date }}"
+        remote_src: yes
+      when: not is_macos and sshd_exists.rc == 0
+      
+    - name: Create backup of original sshd_config (macOS)
+      command: "sudo cp {{ sshd_config_file }} {{ sshd_config_file }}.backup.{{ ansible_date_time.date }}"
+      when: is_macos
+      changed_when: true
+
+    - name: Set host key paths based on OS
+      set_fact:
+        host_key_path_prefix: "{{ '/etc/ssh' if not is_macos else '/etc/ssh' }}"
+        
+    - name: Update SSH Host Key Algorithms (Linux)
+      lineinfile:
+        path: "{{ sshd_config_file }}"
+        regexp: '^#?HostKey\s+{{ host_key_path_prefix }}/ssh_host_ecdsa_key'
+        line: '#HostKey {{ host_key_path_prefix }}/ssh_host_ecdsa_key # Disabled - NIST curves potentially compromised'
+      when: not is_macos and sshd_exists.rc == 0
+
+    - name: Update SSH Host Key Algorithms (macOS)
+      lineinfile:
+        path: "{{ sshd_config_file }}"
+        regexp: '^#?HostKey\s+{{ host_key_path_prefix }}/ssh_host_ecdsa_key'
+        line: '#HostKey {{ host_key_path_prefix }}/ssh_host_ecdsa_key # Disabled - NIST curves potentially compromised'
+      when: is_macos
+      ignore_errors: yes
+      register: macos_update_result
+
+    - name: Update SSH Host Key Algorithms with sudo (macOS)
+      shell: |
+        sudo sed -i.bak 's/^#?HostKey\s\+{{ host_key_path_prefix | regex_escape }}\/ssh_host_ecdsa_key.*/#HostKey {{ host_key_path_prefix }}\/ssh_host_ecdsa_key # Disabled - NIST curves potentially compromised/g' {{ sshd_config_file }}
+      when: is_macos and macos_update_result is failed
+      changed_when: true
+
+    - name: Ensure ED25519 host key is used (Linux)
+      lineinfile:
+        path: "{{ sshd_config_file }}"
+        regexp: '^#?HostKey\s+{{ host_key_path_prefix }}/ssh_host_ed25519_key'
+        line: 'HostKey {{ host_key_path_prefix }}/ssh_host_ed25519_key'
+      when: not is_macos and sshd_exists.rc == 0
+
+    - name: Ensure ED25519 host key is used (macOS)
+      lineinfile:
+        path: "{{ sshd_config_file }}"
+        regexp: '^#?HostKey\s+{{ host_key_path_prefix }}/ssh_host_ed25519_key'
+        line: 'HostKey {{ host_key_path_prefix }}/ssh_host_ed25519_key'
+      when: is_macos
+      ignore_errors: yes
+      register: macos_ed25519_result
+
+    - name: Ensure ED25519 host key is used with sudo (macOS)
+      shell: |
+        sudo sed -i.bak 's/^#?HostKey\s\+{{ host_key_path_prefix | regex_escape }}\/ssh_host_ed25519_key.*/HostKey {{ host_key_path_prefix }}\/ssh_host_ed25519_key/g' {{ sshd_config_file }}
+      when: is_macos and macos_ed25519_result is failed
+      changed_when: true
+
+    - name: Ensure RSA host key is used (Linux)
+      lineinfile:
+        path: "{{ sshd_config_file }}"
+        regexp: '^#?HostKey\s+{{ host_key_path_prefix }}/ssh_host_rsa_key'
+        line: 'HostKey {{ host_key_path_prefix }}/ssh_host_rsa_key'
+      when: not is_macos and sshd_exists.rc == 0
+
+    - name: Ensure RSA host key is used (macOS)
+      lineinfile:
+        path: "{{ sshd_config_file }}"
+        regexp: '^#?HostKey\s+{{ host_key_path_prefix }}/ssh_host_rsa_key'
+        line: 'HostKey {{ host_key_path_prefix }}/ssh_host_rsa_key'
+      when: is_macos
+      ignore_errors: yes
+      register: macos_rsa_result
+
+    - name: Ensure RSA host key is used with sudo (macOS)
+      shell: |
+        sudo sed -i.bak 's/^#?HostKey\s\+{{ host_key_path_prefix | regex_escape }}\/ssh_host_rsa_key.*/HostKey {{ host_key_path_prefix }}\/ssh_host_rsa_key/g' {{ sshd_config_file }}
+      when: is_macos and macos_rsa_result is failed
+      changed_when: true
+
+    - name: Generate ED25519 host key if it doesn't exist (Linux)
+      command: ssh-keygen -t ed25519 -f {{ host_key_path_prefix }}/ssh_host_ed25519_key -N ""
+      args:
+        creates: "{{ host_key_path_prefix }}/ssh_host_ed25519_key"
+      when: not is_macos and sshd_exists.rc == 0
+
+    - name: Generate ED25519 host key if it doesn't exist (macOS)
+      command: ssh-keygen -t ed25519 -f {{ host_key_path_prefix }}/ssh_host_ed25519_key -N ""
+      args:
+        creates: "{{ host_key_path_prefix }}/ssh_host_ed25519_key"
+      when: is_macos
+      ignore_errors: yes
+      register: macos_keygen_result
+
+    - name: Generate ED25519 host key with sudo (macOS)
+      command: sudo ssh-keygen -t ed25519 -f {{ host_key_path_prefix }}/ssh_host_ed25519_key -N ""
+      args:
+        creates: "{{ host_key_path_prefix }}/ssh_host_ed25519_key"
+      when: is_macos and macos_keygen_result is failed
+      changed_when: true
+
+    # Configure key algorithms for each OS type
+    - name: Set strong Key Exchange algorithms (Linux)
+      lineinfile:
+        path: "{{ sshd_config_file }}"
+        regexp: '^#?KexAlgorithms\s+'
+        line: 'KexAlgorithms {{ kex_algorithms | join(",") }}'
+      when: not is_macos and sshd_exists.rc == 0
+
+    - name: Set strong Key Exchange algorithms (macOS)
+      lineinfile:
+        path: "{{ sshd_config_file }}"
+        regexp: '^#?KexAlgorithms\s+'
+        line: 'KexAlgorithms {{ kex_algorithms | join(",") }}'
+      when: is_macos
+      ignore_errors: yes
+      register: macos_kex_result
+
+    - name: Set strong Key Exchange algorithms with sudo (macOS)
+      shell: |
+        sudo sed -i.bak 's/^#?KexAlgorithms\s.*/KexAlgorithms {{ kex_algorithms | join(",") | regex_escape }}/g' {{ sshd_config_file }}
+        if ! grep -q "^KexAlgorithms" {{ sshd_config_file }}; then
+          echo "KexAlgorithms {{ kex_algorithms | join(",") }}" | sudo tee -a {{ sshd_config_file }}
+        fi
+      when: is_macos and macos_kex_result is failed
+      changed_when: true
+
+    - name: Set strong Ciphers (Linux)
+      lineinfile:
+        path: "{{ sshd_config_file }}"
+        regexp: '^#?Ciphers\s+'
+        line: 'Ciphers {{ ciphers | join(",") }}'
+      when: not is_macos and sshd_exists.rc == 0
+
+    - name: Set strong Ciphers (macOS)
+      lineinfile:
+        path: "{{ sshd_config_file }}"
+        regexp: '^#?Ciphers\s+'
+        line: 'Ciphers {{ ciphers | join(",") }}'
+      when: is_macos
+      ignore_errors: yes
+      register: macos_ciphers_result
+
+    - name: Set strong Ciphers with sudo (macOS)
+      shell: |
+        sudo sed -i.bak 's/^#?Ciphers\s.*/Ciphers {{ ciphers | join(",") | regex_escape }}/g' {{ sshd_config_file }}
+        if ! grep -q "^Ciphers" {{ sshd_config_file }}; then
+          echo "Ciphers {{ ciphers | join(",") }}" | sudo tee -a {{ sshd_config_file }}
+        fi
+      when: is_macos and macos_ciphers_result is failed
+      changed_when: true
+
+    - name: Set strong MAC algorithms (Linux)
+      lineinfile:
+        path: "{{ sshd_config_file }}"
+        regexp: '^#?MACs\s+'
+        line: 'MACs {{ macs | join(",") }}'
+      when: not is_macos and sshd_exists.rc == 0
+
+    - name: Set strong MAC algorithms (macOS)
+      lineinfile:
+        path: "{{ sshd_config_file }}"
+        regexp: '^#?MACs\s+'
+        line: 'MACs {{ macs | join(",") }}'
+      when: is_macos
+      ignore_errors: yes
+      register: macos_macs_result
+
+    - name: Set strong MAC algorithms with sudo (macOS)
+      shell: |
+        sudo sed -i.bak 's/^#?MACs\s.*/MACs {{ macs | join(",") | regex_escape }}/g' {{ sshd_config_file }}
+        if ! grep -q "^MACs" {{ sshd_config_file }}; then
+          echo "MACs {{ macs | join(",") }}" | sudo tee -a {{ sshd_config_file }}
+        fi
+      when: is_macos and macos_macs_result is failed
+      changed_when: true
+
+    - name: Set HostKeyAlgorithms (Linux)
+      lineinfile:
+        path: "{{ sshd_config_file }}"
+        regexp: '^#?HostKeyAlgorithms\s+'
+        line: 'HostKeyAlgorithms {{ host_key_algorithms | join(",") }}'
+      when: not is_macos and sshd_exists.rc == 0
+
+    - name: Set HostKeyAlgorithms (macOS)
+      lineinfile:
+        path: "{{ sshd_config_file }}"
+        regexp: '^#?HostKeyAlgorithms\s+'
+        line: 'HostKeyAlgorithms {{ host_key_algorithms | join(",") }}'
+      when: is_macos
+      ignore_errors: yes
+      register: macos_hostkeyalg_result
+
+    - name: Set HostKeyAlgorithms with sudo (macOS)
+      shell: |
+        sudo sed -i.bak 's/^#?HostKeyAlgorithms\s.*/HostKeyAlgorithms {{ host_key_algorithms | join(",") | regex_escape }}/g' {{ sshd_config_file }}
+        if ! grep -q "^HostKeyAlgorithms" {{ sshd_config_file }}; then
+          echo "HostKeyAlgorithms {{ host_key_algorithms | join(",") }}" | sudo tee -a {{ sshd_config_file }}
+        fi
+      when: is_macos and macos_hostkeyalg_result is failed
+      changed_when: true
+
+    # OS-specific DH modulus settings
+    - name: Set new minimum modulus size for DH (Linux)
+      lineinfile:
+        path: "{{ sshd_config_file }}"
+        regexp: '^#?DH_Server_Min_ModulusSize_Bits\s+'
+        line: 'DH_Server_Min_ModulusSize_Bits 3072'
+      when: not is_macos and sshd_exists.rc == 0 and (is_rhel8 or is_al2023)
+
+    # Additional SSH hardening settings - OS specific
+    - name: Apply common security settings for Linux
+      block:
+        - name: Disable root login
+          lineinfile:
+            path: "{{ sshd_config_file }}"
+            regexp: '^#?PermitRootLogin\s+'
+            line: 'PermitRootLogin no'
+
+        - name: Disable password authentication
+          lineinfile:
+            path: "{{ sshd_config_file }}"
+            regexp: '^#?PasswordAuthentication\s+'
+            line: 'PasswordAuthentication no'
+
+        - name: Enable PubkeyAuthentication
+          lineinfile:
+            path: "{{ sshd_config_file }}"
+            regexp: '^#?PubkeyAuthentication\s+'
+            line: 'PubkeyAuthentication yes'
+
+        - name: Disable challenge-response authentication
+          lineinfile:
+            path: "{{ sshd_config_file }}"
+            regexp: '^#?ChallengeResponseAuthentication\s+'
+            line: 'ChallengeResponseAuthentication no'
+
+        - name: Disable X11 forwarding
+          lineinfile:
+            path: "{{ sshd_config_file }}"
+            regexp: '^#?X11Forwarding\s+'
+            line: 'X11Forwarding no'
+
+        - name: Enable strict modes
+          lineinfile:
+            path: "{{ sshd_config_file }}"
+            regexp: '^#?StrictModes\s+'
+            line: 'StrictModes yes'
+            
+        # RHEL 8 specific settings
+        - name: Apply RHEL 8 specific settings
+          block:
+            - name: Set LoginGraceTime for RHEL 8
+              lineinfile:
+                path: "{{ sshd_config_file }}"
+                regexp: '^#?LoginGraceTime\s+'
+                line: 'LoginGraceTime 60'
+                
+            - name: Set MaxAuthTries for RHEL 8
+              lineinfile:
+                path: "{{ sshd_config_file }}"
+                regexp: '^#?MaxAuthTries\s+'
+                line: 'MaxAuthTries 4'
+          when: is_rhel8
+          
+        # Amazon Linux 2023 specific settings
+        - name: Apply AL2023 specific settings
+          block:
+            - name: Set ClientAliveInterval for AL2023
+              lineinfile:
+                path: "{{ sshd_config_file }}"
+                regexp: '^#?ClientAliveInterval\s+'
+                line: 'ClientAliveInterval 300'
+                
+            - name: Set ClientAliveCountMax for AL2023
+              lineinfile:
+                path: "{{ sshd_config_file }}"
+                regexp: '^#?ClientAliveCountMax\s+'
+                line: 'ClientAliveCountMax 3'
+          when: is_al2023
+      when: not is_macos and sshd_exists.rc == 0
+
+    # macOS specific settings
+    - name: Apply security settings for macOS
+      block:
+        - name: Disable root login (macOS)
+          lineinfile:
+            path: "{{ sshd_config_file }}"
+            regexp: '^#?PermitRootLogin\s+'
+            line: 'PermitRootLogin no'
+          ignore_errors: yes
+          register: macos_rootlogin_result
+
+        - name: Disable root login with sudo (macOS)
+          shell: |
+            sudo sed -i.bak 's/^#?PermitRootLogin\s.*/PermitRootLogin no/g' {{ sshd_config_file }}
+            if ! grep -q "^PermitRootLogin" {{ sshd_config_file }}; then
+              echo "PermitRootLogin no" | sudo tee -a {{ sshd_config_file }}
+            fi
+          when: macos_rootlogin_result is failed
+          changed_when: true
+
+        # Apply similar pattern for other security settings
+        - name: Apply additional macOS security settings with sudo
+          shell: |
+            # Password authentication
+            sudo sed -i.bak 's/^#?PasswordAuthentication\s.*/PasswordAuthentication no/g' {{ sshd_config_file }}
+            if ! grep -q "^PasswordAuthentication" {{ sshd_config_file }}; then
+              echo "PasswordAuthentication no" | sudo tee -a {{ sshd_config_file }}
+            fi
+            
+            # Public key authentication
+            sudo sed -i.bak 's/^#?PubkeyAuthentication\s.*/PubkeyAuthentication yes/g' {{ sshd_config_file }}
+            if ! grep -q "^PubkeyAuthentication" {{ sshd_config_file }}; then
+              echo "PubkeyAuthentication yes" | sudo tee -a {{ sshd_config_file }}
+            fi
+            
+            # Challenge-response authentication
+            sudo sed -i.bak 's/^#?ChallengeResponseAuthentication\s.*/ChallengeResponseAuthentication no/g' {{ sshd_config_file }}
+            if ! grep -q "^ChallengeResponseAuthentication" {{ sshd_config_file }}; then
+              echo "ChallengeResponseAuthentication no" | sudo tee -a {{ sshd_config_file }}
+            fi
+            
+            # X11 forwarding
+            sudo sed -i.bak 's/^#?X11Forwarding\s.*/X11Forwarding no/g' {{ sshd_config_file }}
+            if ! grep -q "^X11Forwarding" {{ sshd_config_file }}; then
+              echo "X11Forwarding no" | sudo tee -a {{ sshd_config_file }}
+            fi
+            
+            # Strict modes
+            sudo sed -i.bak 's/^#?StrictModes\s.*/StrictModes yes/g' {{ sshd_config_file }}
+            if ! grep -q "^StrictModes" {{ sshd_config_file }}; then
+              echo "StrictModes yes" | sudo tee -a {{ sshd_config_file }}
+            fi
+            
+            # macOS specific - UseKeychain
+            sudo sed -i.bak 's/^#?UseKeychain\s.*/UseKeychain yes/g' {{ sshd_config_file }}
+            if ! grep -q "^UseKeychain" {{ sshd_config_file }}; then
+              echo "UseKeychain yes" | sudo tee -a {{ sshd_config_file }}
+            fi
+          changed_when: true
+      when: is_macos
+
+    # Service restart and verification - OS specific
+    - name: Restart SSH service (Linux)
+      service:
+        name: "{{ ssh_service_name }}"
+        state: restarted
+      ignore_errors: yes
+      when: not is_macos and sshd_exists.rc == 0
+
+    - name: Restart SSH service (macOS)
+      command: "sudo launchctl unload /System/Library/LaunchDaemons/ssh.plist"
+      ignore_errors: yes
+      when: is_macos
+      changed_when: true
+      
+    - name: Wait a moment before loading the service again (macOS)
+      pause:
+        seconds: 2
+      when: is_macos
+      
+    - name: Start SSH service (macOS)
+      command: "sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist"
+      ignore_errors: yes
+      when: is_macos
+      changed_when: true
+
+    # Verification steps
+    - name: Verify SSH config (Linux)
+      command: sshd -t
+      register: sshd_check
+      ignore_errors: yes
+      changed_when: false
+      when: not is_macos and sshd_exists.rc == 0
+
+    - name: Verify SSH config (macOS)
+      command: sshd -t
+      register: macos_sshd_check
+      ignore_errors: yes
+      changed_when: false
+      when: is_macos
+
+    - name: Display SSH config check result (Linux)
+      debug:
+        var: sshd_check
+      when: not is_macos and sshd_exists.rc == 0 and sshd_check is defined
+
+    - name: Display SSH config check result (macOS)
+      debug:
+        var: macos_sshd_check
+      when: is_macos and macos_sshd_check is defined
+
+    # Restore config if verification failed
+    - name: Restore backup if config check failed (Linux)
+      copy:
+        src: "{{ sshd_config_file }}.backup.{{ ansible_date_time.date }}"
+        dest: "{{ sshd_config_file }}"
+        remote_src: yes
+      when: not is_macos and sshd_exists.rc == 0 and sshd_check.rc != 0
+
+    - name: Restore backup if config check failed (macOS)
+      command: "sudo cp {{ sshd_config_file }}.backup.{{ ansible_date_time.date }} {{ sshd_config_file }}"
+      when: is_macos and macos_sshd_check is defined and macos_sshd_check.rc != 0
+      changed_when: true
+
+    # Restart after config restore if needed
+    - name: Restart SSH service after config restore (Linux)
+      service:
+        name: "{{ ssh_service_name }}"
+        state: restarted
+      ignore_errors: yes
+      when: not is_macos and sshd_exists.rc == 0 and sshd_check.rc != 0
+
+    - name: Restart SSH service after config restore (macOS)
+      block:
+        - name: Unload SSH service
+          command: "sudo launchctl unload /System/Library/LaunchDaemons/ssh.plist"
+          ignore_errors: yes
+          
+        - name: Wait a moment before loading the service again
+          pause:
+            seconds: 2
+            
+        - name: Load SSH service
+          command: "sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist"
+          ignore_errors: yes
+      when: is_macos and macos_sshd_check is defined and macos_sshd_check.rc != 0
+      changed_when: true
+      
+    # Final summary
+    - name: Summary of SSH hardening
+      debug:
+        msg: |
+          SSH server hardening completed for {{ ansible_distribution }} {{ ansible_distribution_version }}
+          
+          OS type: {{ "macOS" if is_macos else "RHEL 8" if is_rhel8 else "Amazon Linux 2023" if is_al2023 else "Other Linux" }}
+          SSH configuration file: {{ sshd_config_file }}
+          
+          Verification results:
+          {{ "✓ Configuration valid" if ((not is_macos and sshd_check.rc == 0) or (is_macos and macos_sshd_check.rc == 0)) else "⚠️ Configuration check returned non-zero exit code" }}
+          
+          The original configuration has been backed up to {{ sshd_config_file }}.backup.{{ ansible_date_time.date }}
+          
+          Please verify SSH functionality by opening a new session before closing this one!

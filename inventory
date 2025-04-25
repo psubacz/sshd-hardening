@@ -1,0 +1,19 @@
+# Update with your actual hostnames/IPs
+[linux_servers]
+your-server1.example.com ansible_port=22
+192.168.1.10 ansible_port=22
+
+[rhel8_servers]
+rhel8-server.example.com
+
+[al2023_servers]
+al2023
+
+[macos_clients]
+mac-client.local
+
+[linux_clients]
+your-workstation.example.com
+
+[default]
+localhost
