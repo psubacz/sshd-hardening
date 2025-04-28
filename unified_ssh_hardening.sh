@@ -243,7 +243,7 @@ if [ "$RUN_PLAYBOOK" = true ]; then
     ANSIBLE_COMMAND="ansible-playbook $PLAYBOOK_PATH -i $INVENTORY_FILE"
     
     if [ "$CONNECTION_TYPE" = "local" ]; then
-        ANSIBLE_COMMAND="$ANSIBLE_COMMAND --connection=local --ask-become-pass"
+        ANSIBLE_COMMAND="$ANSIBLE_COMMAND --connection=local"
     fi
     
     ANSIBLE_COMMAND="$ANSIBLE_COMMAND -l $LIMIT_HOSTS"
